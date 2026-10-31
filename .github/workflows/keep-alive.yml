@@ -2,12 +2,23 @@ name: Supabase Keep-Alive
 
 on:
   schedule:
-    - cron: '0 0 */3 * *' # Her 3 günde bir çalışır (7 günü rahatça kurtarır)
+    # Her gun 03:17 UTC. GitHub cron zamanlari yogun saatlerde gecikebilir,
+    # bu yuzden 7 gunluk pencereye genis pay birakiyoruz.
+    - cron: '17 3 * * *'
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supabase-keep-alive
+  cancel-in-progress: false
 
 jobs:
   ping:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
       - name: Check secrets
         env:
@@ -15,24 +26,63 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
           if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_KEY" ]; then
-            echo "SUPABASE_URL veya SUPABASE_KEY secret eksik"
+            echo "::error::SUPABASE_URL veya SUPABASE_KEY secret eksik"
             exit 1
           fi
 
-      - name: Send request to Supabase
+      - name: Ping database (real PostgREST query)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           BASE="${SUPABASE_URL%/}"
-          code=$(curl -sS --retry 3 --retry-delay 5 \
-            -o /tmp/body.txt -w '%{http_code}' \
-            "$BASE/auth/v1/health" \
-            -H "apikey: $SUPABASE_KEY")
-          cat /tmp/body.txt
-          echo "HTTP $code"
-          if [ "$code" != "200" ]; then
-            echo "Supabase yanıtı 200 değil: $code"
+          BODY="$(mktemp)"
+
+          # $1 = etiket, geri kalan = curl argumanlari
+          ping() {
+            local label="$1"; shift
+            local code
+            code=$(curl -sS --max-time 20 \
+              --retry 3 --retry-delay 5 --retry-connrefused \
+              -o "$BODY" -w '%{http_code}' "$@") || code="000"
+            echo "--- $label -> HTTP $code"
+            head -c 300 "$BODY" 2>/dev/null; echo
+            case "$code" in
+              200|204) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          ok=0
+
+          # 1) Gercek Postgres sorgusu: public.keepalive() RPC.
+          #    anon key yeterli, SECURITY DEFINER, sadece now() dondurur.
+          if ping "rpc/keepalive" -X POST "$BASE/rest/v1/rpc/keepalive" \
+               -H "apikey: $SUPABASE_KEY" \
+               -H "Authorization: Bearer $SUPABASE_KEY" \
+               -H "Content-Type: application/json" \
+               -d '{}'; then
+            echo "Database awake (RPC)."
+            ok=1
+          elif ping "auth/v1/health" "$BASE/auth/v1/health" -H "apikey: $SUPABASE_KEY"; then
+            echo "::warning::RPC keepalive basarisiz, /auth/v1/health yedegine dusuldu"
+            ok=1
+          elif ping "storage/v1/version" "$BASE/storage/v1/version" -H "apikey: $SUPABASE_KEY"; then
+            echo "::warning::RPC ve auth basarisiz, /storage/v1/version yedegine dusuldu"
+            ok=1
+          fi
+
+          rm -f "$BODY"
+
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::Supabase ping basarisiz - URL/key veya proje durumunu kontrol et"
             exit 1
           fi
+
+          {
+            echo "### Supabase keep-alive"
+            echo "- URL: \`$BASE\`"
+            echo "- Sonuc: OK"
+            echo "- Zaman: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } >> "$GITHUB_STEP_SUMMARY"
