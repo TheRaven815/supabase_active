@@ -9,11 +9,30 @@ jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
+      - name: Check secrets
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_KEY" ]; then
+            echo "SUPABASE_URL veya SUPABASE_KEY secret eksik"
+            exit 1
+          fi
+
       - name: Send request to Supabase
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
-          curl -X GET "$SUPABASE_URL/rest/v1/" \
-          -H "apikey: $SUPABASE_URL" \
-          -H "Authorization: Bearer $SUPABASE_KEY"
+          set -euo pipefail
+          BASE="${SUPABASE_URL%/}"
+          code=$(curl -sS --retry 3 --retry-delay 5 \
+            -o /tmp/body.txt -w '%{http_code}' \
+            "$BASE/auth/v1/health" \
+            -H "apikey: $SUPABASE_KEY")
+          cat /tmp/body.txt
+          echo "HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "Supabase yanıtı 200 değil: $code"
+            exit 1
+          fi
